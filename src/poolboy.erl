@@ -18,7 +18,7 @@
 -endif.
 
 -type pool() ::
-    Name :: atom() |
+    Name :: (atom() | pid()) |
     {Name :: atom(), node()} |
     {local, Name :: atom()} |
     {global, GlobalName :: any()} |
@@ -34,7 +34,8 @@
     monitors :: ets:tid(),
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
-    max_overflow = 10 :: non_neg_integer()
+    max_overflow = 10 :: non_neg_integer(),
+    strategy = lifo :: lifo | fifo
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -132,6 +133,10 @@ init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
     init(Rest, WorkerArgs, State#state{size = Size});
 init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(MaxOverflow) ->
     init(Rest, WorkerArgs, State#state{max_overflow = MaxOverflow});
+init([{strategy, lifo} | Rest], WorkerArgs, State) ->
+    init(Rest, WorkerArgs, State#state{strategy = lifo});
+init([{strategy, fifo} | Rest], WorkerArgs, State) ->
+    init(Rest, WorkerArgs, State#state{strategy = fifo});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
@@ -150,7 +155,9 @@ handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     end;
 
 handle_cast({cancel_waiting, Pid}, State) ->
-    Waiting = queue:filter(fun ({{P, _}, _}) -> P =/= Pid end, State#state.waiting),
+    Waiting = queue:filter(fun ({{P, _}, Ref}) ->
+        P =/= Pid orelse not(erlang:demonitor(Ref))
+    end, State#state.waiting),
     {noreply, State#state{waiting = Waiting}};
 
 handle_cast(_Msg, State) ->
@@ -196,7 +203,6 @@ handle_call(get_all_monitors, _From, State) ->
     Monitors = ets:tab2list(State#state.monitors),
     {reply, Monitors, State};
 handle_call(stop, _From, State) ->
-    true = exit(State#state.supervisor, shutdown),
     {stop, normal, ok, State};
 handle_call(_Msg, _From, State) ->
     Reply = {error, invalid_message},
@@ -234,7 +240,9 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    ok = lists:foreach(fun (W) -> unlink(W) end, State#state.workers),
+    true = exit(State#state.supervisor, shutdown),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -276,10 +284,10 @@ handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
            waiting = Waiting,
            monitors = Monitors,
-           overflow = Overflow} = State,
+           overflow = Overflow,
+           strategy = Strategy} = State,
     case queue:out(Waiting) of
-        {{value, {{FromPid, _} = From, _}}, Left} ->
-            Ref = erlang:monitor(process, FromPid),
+        {{value, {From, Ref}}, Left} ->
             true = ets:insert(Monitors, {Pid, Ref}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
@@ -287,7 +295,10 @@ handle_checkin(Pid, State) ->
             ok = dismiss_worker(Sup, Pid),
             State#state{waiting = Empty, overflow = Overflow - 1};
         {empty, Empty} ->
-            Workers = [Pid | State#state.workers],
+            Workers = case Strategy of
+                lifo -> [Pid | State#state.workers];
+                fifo -> State#state.workers ++ [Pid]
+            end,
             State#state{workers = Workers, waiting = Empty, overflow = 0}
     end.
 
@@ -296,10 +307,9 @@ handle_worker_exit(Pid, State) ->
            monitors = Monitors,
            overflow = Overflow} = State,
     case queue:out(State#state.waiting) of
-        {{value, {{FromPid, _} = From, _}}, LeftWaiting} ->
-            MonitorRef = erlang:monitor(process, FromPid),
+        {{value, {From, Ref}}, LeftWaiting} ->
             NewWorker = new_worker(State#state.supervisor),
-            true = ets:insert(Monitors, {NewWorker, MonitorRef}),
+            true = ets:insert(Monitors, {NewWorker, Ref}),
             gen_server:reply(From, NewWorker),
             State#state{waiting = LeftWaiting};
         {empty, Empty} when Overflow > 0 ->
